@@ -43,10 +43,20 @@ permissions:
 
 jobs:
   build-ipa:
-    runs-on: macos-latest
+    # macos-latest/macos-15 use ARM64; use Intel to avoid ARM64 queue shortages.
+    runs-on: macos-15-intel
     timeout-minutes: 45
 
     steps:
+      - name: Runner and Xcode diagnostics
+        run: |
+          set -euo pipefail
+          echo "Runner OS: $(sw_vers -productVersion)"
+          echo "Runner architecture: $(uname -m)"
+          xcodebuild -version
+          xcode-select -p
+          df -h .
+
       - name: Download Xcode ZIP from temporary release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -54,14 +64,20 @@ jobs:
           ASSET_NAME: ${{ inputs.asset_name }}
         run: |
           set -euo pipefail
+          # Pass the asset name safely to jq (works even if it contains quotes).
           ASSET_ID="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
-            --jq ".assets[] | select(.name == \"${ASSET_NAME}\") | .id" | head -n 1)"
+            | jq -r --arg asset "$ASSET_NAME" '[.assets[] | select(.name == $asset) | .id][0] // empty')"
           if [[ -z "$ASSET_ID" ]]; then
             echo "Cannot find release asset: $ASSET_NAME" >&2
             exit 1
           fi
           gh api -H "Accept: application/octet-stream" \
             "repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}" > xcode-input.zip
+          if [[ ! -s xcode-input.zip ]]; then
+            echo "Downloaded Xcode ZIP is empty." >&2
+            exit 1
+          fi
+          unzip -tq xcode-input.zip
           mkdir -p source
           ditto -x -k xcode-input.zip source
 
@@ -195,10 +211,22 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  # Cleanup runs on Linux, even if the macOS build job cannot acquire a runner.
+  cleanup-temporary-release:
+    if: ${{ always() }}
+    needs: [build-ipa]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
       - name: Delete temporary input release
-        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_ID: ${{ inputs.release_id }}
         run: |
-          gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" || true
+          set -euo pipefail
+          if [[ -n "$RELEASE_ID" ]]; then
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" \
+              || echo "Warning: temporary release could not be deleted (perhaps already removed)."
+          fi
